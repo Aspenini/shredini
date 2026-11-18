@@ -24,10 +24,10 @@ jobs:
           python-version: '3.12'
       - name: Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libwayland-dev libxkbcommon-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev libvulkan1
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --release --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --release --locked --workspace
       - name: Package Windows WASAPI
         if: runner.os == 'Windows'
         shell: pwsh

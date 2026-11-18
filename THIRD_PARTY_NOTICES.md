@@ -1,11 +1,12 @@
 # Third-party components
 
 Shredini's original source is MIT licensed. Dependency versions and sources are
-recorded in Cargo.lock. The application uses CPAL (Apache-2.0), egui/eframe
-(MIT OR Apache-2.0), ringbuf (MIT OR Apache-2.0), Rubato (MIT), biquad (MIT),
+recorded in Cargo.lock. The application uses CPAL (Apache-2.0), GPUI (Apache-2.0),
+Clack (MIT OR Apache-2.0), ringbuf (MIT OR Apache-2.0), Rubato (MIT), biquad (MIT),
 Serde (MIT OR Apache-2.0), and their transitive dependencies under their respective
 licenses. Dependency license texts remain available in their published sources.
-USB MIDI connectivity uses midir (MIT). RustySynth (MIT) renders SoundFonts;
+MIDI connectivity uses midir (MIT), and Standard MIDI File import uses midly (MIT).
+Hound (Apache-2.0) writes WAV audio. RustySynth (MIT) renders SoundFonts;
 Symphonia (MPL-2.0) decodes audio files; rfd (MIT) provides native file dialogs.
 The original oscillator/envelope and single-sample instrument code is part of
 Shredini.

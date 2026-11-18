@@ -1,3 +1,4 @@
+use crate::effects::{Amp, Effects};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
@@ -12,6 +13,7 @@ pub struct ToneParameters {
     pub input_trim_db: f32,
     pub output_db: f32,
     pub bypass: bool,
+    pub effects: Effects,
 }
 
 impl Default for ToneParameters {
@@ -25,6 +27,7 @@ impl Default for ToneParameters {
             input_trim_db: 0.0,
             output_db: -12.0,
             bypass: false,
+            effects: Effects::default(),
         }
     }
 }
@@ -38,6 +41,7 @@ impl ToneParameters {
                 fallback
             }
         }
+        self.effects = self.effects.sanitized();
         let d = Self::default();
         self.tone = bounded(self.tone, 0.0, 1.0, d.tone);
         self.warmth = bounded(self.warmth, 0.0, 1.0, d.warmth);
@@ -50,7 +54,8 @@ impl ToneParameters {
 
 /// UI writes targets; the audio thread owns and smooths its local copy.
 pub struct SharedParameters {
-    floats: [AtomicU32; 6],
+    floats: [AtomicU32; 10],
+    amp: AtomicU32,
     compression: AtomicBool,
     bypass: AtomicBool,
 }
@@ -59,6 +64,7 @@ impl SharedParameters {
     pub fn new(p: ToneParameters) -> Self {
         let result = Self {
             floats: std::array::from_fn(|_| AtomicU32::new(0)),
+            amp: AtomicU32::new(0),
             compression: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
         };
@@ -74,14 +80,19 @@ impl SharedParameters {
             p.delay,
             p.input_trim_db,
             p.output_db,
+            p.effects.pitch,
+            p.effects.formant,
+            p.effects.harmony,
+            p.effects.harmony_mix,
         ]) {
             a.store(v.to_bits(), Relaxed);
         }
+        self.amp.store(p.effects.amp as u32, Relaxed);
         self.compression.store(p.compression, Relaxed);
         self.bypass.store(p.bypass, Relaxed);
     }
     pub fn read(&self) -> ToneParameters {
-        let f: [f32; 6] = std::array::from_fn(|i| f32::from_bits(self.floats[i].load(Relaxed)));
+        let f: [f32; 10] = std::array::from_fn(|i| f32::from_bits(self.floats[i].load(Relaxed)));
         ToneParameters {
             tone: f[0],
             warmth: f[1],
@@ -91,6 +102,18 @@ impl SharedParameters {
             output_db: f[5],
             compression: self.compression.load(Relaxed),
             bypass: self.bypass.load(Relaxed),
+            effects: Effects {
+                amp: match self.amp.load(Relaxed) {
+                    1 => Amp::Clean,
+                    2 => Amp::Crunch,
+                    3 => Amp::Bass,
+                    _ => Amp::Off,
+                },
+                pitch: f[6],
+                formant: f[7],
+                harmony: f[8],
+                harmony_mix: f[9],
+            },
         }
     }
 }
@@ -176,6 +199,8 @@ pub enum InstrumentSource {
     MidiKeyboard,
     GuitarAndMidi,
     Playback,
+    Bass,
+    Microphone,
 }
 impl InstrumentSource {
     pub fn label(self) -> &'static str {
@@ -184,10 +209,15 @@ impl InstrumentSource {
             Self::MidiKeyboard => "MIDI keyboard",
             Self::GuitarAndMidi => "Guitar + MIDI",
             Self::Playback => "Audio files",
+            Self::Bass => "Bass / DI",
+            Self::Microphone => "Microphone",
         }
     }
     pub fn has_audio(self) -> bool {
-        matches!(self, Self::Guitar | Self::GuitarAndMidi)
+        matches!(
+            self,
+            Self::Guitar | Self::GuitarAndMidi | Self::Bass | Self::Microphone
+        )
     }
     pub fn has_midi(self) -> bool {
         matches!(self, Self::MidiKeyboard | Self::GuitarAndMidi)

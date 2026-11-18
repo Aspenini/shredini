@@ -1,4 +1,7 @@
-use crate::model::ToneParameters;
+use crate::{
+    effects::{AudioEffect, Rack},
+    model::ToneParameters,
+};
 use biquad::{Biquad, Coefficients, DirectForm2Transposed, Q_BUTTERWORTH_F32, ToHertz, Type};
 
 pub fn db_gain(db: f32) -> f32 {
@@ -65,6 +68,7 @@ impl Reverb {
 }
 
 pub struct Processor {
+    rack: Rack,
     high_pass: DirectForm2Transposed<f32>,
     crossover: f32,
     cross_alpha: f32,
@@ -79,6 +83,7 @@ pub struct Processor {
 }
 impl Processor {
     pub fn new(rate: u32, p: ToneParameters) -> Self {
+        let rack = Rack::new(rate);
         let rate = rate as f32;
         let coefficients = Coefficients::<f32>::from_params(
             Type::HighPass,
@@ -88,6 +93,7 @@ impl Processor {
         )
         .expect("valid audio sample rate");
         let mut result = Self {
+            rack,
             high_pass: DirectForm2Transposed::new(coefficients),
             crossover: 0.0,
             cross_alpha: 1.0 - (-std::f32::consts::TAU * 1100.0 / rate).exp(),
@@ -120,6 +126,7 @@ impl Processor {
     }
     pub fn set_parameters(&mut self, mut p: ToneParameters) {
         p.sanitize();
+        self.rack.set(p.effects);
         let tilt = (p.tone - 0.5) * 12.0;
         self.target = [
             db_gain(tilt),
@@ -142,7 +149,7 @@ impl Processor {
         } else {
             0.0
         };
-        let hp = self.high_pass.run(dry);
+        let hp = self.high_pass.run(self.rack.process(dry));
         if dry.abs() < 1e-20 && hp.abs() < 1e-20 {
             self.high_pass.reset_state();
         }

@@ -133,6 +133,7 @@ impl WebEngine {
             input_trim_db: trim,
             output_db: master,
             bypass,
+            effects: Default::default(),
         };
         self.parameters.sanitize();
     }

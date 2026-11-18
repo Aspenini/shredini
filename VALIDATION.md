@@ -1,5 +1,28 @@
 # Validation record
 
+## Shredini 0.5.0
+
+- Windows x64 passed all 28 Rust workspace tests. The native GPUI app built, and
+  the Studio-disabled player passed a separate Cargo check.
+- Ubuntu WSL passed all 23 release tests for the audio core, engine, and Studio
+  crates. The Linux GPUI desktop also passed a Cargo check after pinning libc to
+  the last compatible version for GPUI's archived-tar dependency.
+- Windows desktop verification covered adding a note in the piano roll,
+  playing the arrangement through 48 kHz WASAPI, and recording a virtual piano
+  note into a dry take. Finishing the take opened its track in Studio. The 32-bit
+  float WAV held nonzero audio, and the recovered project retained the editable
+  effects snapshot.
+- A synthetic stereo CLAP effect verified the processing and bypass paths
+  across the 64-frame adapter without callback allocations. The Studio tests
+  verified WAV round-trip, source preservation, editable effect persistence,
+  MIDI import and mix timing.
+- The WebAssembly library passed its build check and all four browser-state
+  tests passed.
+- Native macOS, Linux desktop playback, TONEX, external microphones and MIDI
+  controllers, and commercial plugins still need hardware or hands-on checks.
+
+## Historical validation for earlier versions
+
 Validation performed on Windows x64 and Ubuntu/WSL x64 with Rust 1.99.1, plus a
 Chromium-based browser for the web build. Native macOS validation is pending.
 This document distinguishes software verification from hardware checks.

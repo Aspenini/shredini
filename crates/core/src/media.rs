@@ -252,7 +252,7 @@ fn decode_source(
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_font() -> Result<Arc<SoundFont>> {
-    let bytes = include_bytes!("../assets/GeneralUser-GS.sf2");
+    let bytes = include_bytes!("../../../assets/GeneralUser-GS.sf2");
     Ok(Arc::new(
         SoundFont::new(&mut Cursor::new(bytes.as_slice()))
             .map_err(|e| anyhow::anyhow!("Instrument bank: {e}"))?,
@@ -315,6 +315,7 @@ pub struct Resources {
 pub enum Update {
     Sample(Option<Arc<Clip>>),
     Backing(Option<Arc<Clip>>),
+    Play(Arc<Clip>),
     Font(Option<Box<FontPlayer>>),
 }
 pub struct ControlPorts {
@@ -370,6 +371,13 @@ impl Runtime {
                     self.position = 0.0;
                     Update::Backing(std::mem::replace(&mut self.backing, clip))
                 }
+                Update::Play(clip) => {
+                    self.position = 0.0;
+                    self.last_seek = self.state.seek_revision.load(Relaxed);
+                    self.state.length.store(clip.frames.len() as u64, Relaxed);
+                    self.state.playing.store(true, Relaxed);
+                    Update::Backing(self.backing.replace(clip))
+                }
                 Update::Sample(clip) => {
                     if let Some(i) = instrument {
                         i.reset_notes();
@@ -402,6 +410,10 @@ impl Runtime {
         }
     }
     pub fn tick(&mut self, rate: u32, master_db: f32) -> [f32; 2] {
+        self.tick_gain(rate, crate::dsp::db_gain(master_db))
+    }
+
+    pub fn tick_gain(&mut self, rate: u32, master_gain: f32) -> [f32; 2] {
         let playing = self.state.playing.load(Relaxed);
         let target = if playing {
             f32::from_bits(self.state.gain.load(Relaxed))
@@ -409,8 +421,7 @@ impl Runtime {
             0.0
         };
         self.gain += (target - self.gain) * (1.0 / (0.005 * rate as f32));
-        self.master +=
-            (crate::dsp::db_gain(master_db) - self.master) * (1.0 / (0.020 * rate as f32));
+        self.master += (master_gain - self.master) * (1.0 / (0.020 * rate as f32));
         let mut pair = [0.0; 2];
         if let Some(clip) = &self.backing
             && (playing || self.gain > 0.00001)
@@ -463,7 +474,7 @@ impl Runtime {
 }
 
 pub enum Loaded {
-    Audio(Role, Arc<Clip>),
+    Audio(Role, Arc<Clip>, Vec<f32>),
     Font(Arc<SoundFont>),
 }
 pub struct ImportResult {
@@ -472,7 +483,7 @@ pub struct ImportResult {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Importer {
-    tx: mpsc::SyncSender<(Role, Option<PathBuf>)>,
+    tx: mpsc::SyncSender<(Role, PathBuf)>,
     pub results: mpsc::Receiver<ImportResult>,
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -484,34 +495,20 @@ impl Default for Importer {
 #[cfg(not(target_arch = "wasm32"))]
 impl Importer {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::sync_channel::<(Role, Option<PathBuf>)>(8);
+        let (tx, rx) = mpsc::sync_channel::<(Role, PathBuf)>(8);
         let (done, results) = mpsc::channel();
         thread::Builder::new()
             .name("media-import".into())
             .spawn(move || {
                 while let Ok((role, path)) = rx.recv() {
-                    let path = path.or_else(|| {
-                        let dialog = rfd::FileDialog::new();
-                        if role == Role::SoundFont {
-                            dialog.add_filter("SoundFont", &["sf2"]).pick_file()
-                        } else {
-                            dialog
-                                .add_filter("Audio", &["wav", "mp3", "flac", "ogg"])
-                                .pick_file()
-                        }
-                    });
-                    let Some(path) = path else {
-                        let _ = done.send(ImportResult {
-                            path: PathBuf::new(),
-                            result: Err(anyhow::anyhow!("Import cancelled")),
-                        });
-                        continue;
-                    };
                     let result = std::panic::catch_unwind(|| {
                         if role == Role::SoundFont {
                             load_font(&path).map(Loaded::Font)
                         } else {
-                            decode(&path).map(|clip| Loaded::Audio(role, clip))
+                            decode(&path).map(|clip| {
+                                let wave = clip.waveform();
+                                Loaded::Audio(role, clip, wave)
+                            })
                         }
                     })
                     .unwrap_or_else(|_| {
@@ -527,7 +524,7 @@ impl Importer {
             .expect("create media worker");
         Self { tx, results }
     }
-    pub fn import(&self, role: Role, path: Option<PathBuf>) -> bool {
+    pub fn import(&self, role: Role, path: PathBuf) -> bool {
         self.tx.try_send((role, path)).is_ok()
     }
 }
@@ -539,7 +536,7 @@ mod tests {
     fn decode_compressed_formats() {
         for extension in ["mp3", "flac", "ogg"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/test-audio")
+                .join("../../assets/test-audio")
                 .join(format!("tone.{extension}"));
             let clip = decode(&path).unwrap_or_else(|e| panic!("{extension}: {e:#}"));
             assert_eq!(clip.rate, 44100);

@@ -32,7 +32,7 @@ def package():
         (contents / "MacOS").mkdir(parents=True, exist_ok=True)
         executable = contents / "MacOS/shredini"
         with (contents / "Info.plist").open("wb") as file:
-            plistlib.dump({"CFBundleName": "Shredini", "CFBundleDisplayName": "Shredini", "CFBundleIdentifier": "com.shredini.studio", "CFBundleExecutable": "shredini", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version, "LSMinimumSystemVersion": "12.0", "NSHighResolutionCapable": True, "NSMicrophoneUsageDescription": "Shredini processes the guitar or instrument audio input you select while monitoring is started.", "NSPrincipalClass": "NSApplication"}, file)
+            plistlib.dump({"CFBundleName": "Shredini", "CFBundleDisplayName": "Shredini", "CFBundleIdentifier": "com.shredini.studio", "CFBundleExecutable": "shredini", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version, "LSMinimumSystemVersion": "12.0", "NSHighResolutionCapable": True, "NSMicrophoneUsageDescription": "Shredini uses the microphone or instrument input you select while monitoring or recording is started.", "NSPrincipalClass": "NSApplication"}, file)
     else:
         executable = destination / "shredini"
     build_target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))

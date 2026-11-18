@@ -41,6 +41,9 @@ impl Default for Session {
 }
 
 pub fn session_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SHREDINI_DATA_DIR").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path).join("session.json"));
+    }
     // Keep the original storage identifier so the rename preserves saved tones and devices.
     directories::ProjectDirs::from("", "", "Shredinini")
         .map(|d| d.data_local_dir().join("session.json"))

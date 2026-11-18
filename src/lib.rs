@@ -1,8 +1,5 @@
-//! Sound engine shared by the desktop application and the browser AudioWorklet.
+//! Browser AudioWorklet adapter for Shredini's shared Rust engine.
 #[cfg(test)]
 mod allocation_probe;
-pub mod dsp;
-pub mod media;
-pub mod midi;
-pub mod model;
+pub use shredini_audio_core::{dsp, effects, media, midi, model};
 pub mod web_engine;

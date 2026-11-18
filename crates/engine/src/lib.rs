@@ -1,20 +1,26 @@
 //! Device ownership stays on the control thread. Application callbacks only touch
 //! preallocated audio state, an SPSC ring, and lock-free scalar atomics.
-use crate::{
-    dsp::Processor,
-    media, midi,
-    model::{AudioConfig, Backend, InstrumentSource, SharedParameters},
-};
+#[cfg(test)]
+mod allocation_probe;
+mod plugin;
+mod recording;
 use anyhow::{Context, Result, bail};
 use cpal::{
     Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
     SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+pub use plugin::EffectPlugin;
+pub use recording::Take;
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
     audioadapter_buffers::direct::InterleavedSlice,
+};
+use shredini_core::{
+    dsp::Processor,
+    media, midi,
+    model::{AudioConfig, Backend, InstrumentSource, SharedParameters, SynthSound},
 };
 use std::{
     sync::{
@@ -89,10 +95,15 @@ fn peak(a: &AtomicU32, value: f32) {
 
 pub enum Command {
     InstallAudio(media::Role, Arc<media::Clip>),
+    PlayMix(Arc<media::Clip>),
+    ScanPlugin(std::path::PathBuf),
+    SelectPlugin(Option<EffectPlugin>),
     InstallFont(Arc<rustysynth::SoundFont>),
     Refresh,
     Start(AudioConfig),
     Stop,
+    Record,
+    FinishTake,
     Shutdown,
 }
 pub enum Event {
@@ -101,6 +112,10 @@ pub enum Event {
     MidiDevices(Vec<midi::Port>, String),
     Running(RunningInfo),
     Stopped,
+    Recording,
+    Plugins(Vec<EffectPlugin>),
+    PluginSelected(Option<EffectPlugin>),
+    Take(Take),
     Failed(String),
 }
 #[derive(Clone)]
@@ -119,6 +134,7 @@ pub struct RunningInfo {
 
 pub struct Engine {
     pub media: Arc<media::State>,
+    pub mix: Arc<media::State>,
     pub commands: SyncSender<Command>,
     pub events: Receiver<Event>,
     pub diagnostics: Arc<Diagnostics>,
@@ -135,6 +151,9 @@ impl Engine {
         let m = midi.clone();
         let media = Arc::new(media::State::default());
         let shared_media = media.clone();
+        let mix = Arc::new(media::State::default());
+        mix.gain.store(1.0_f32.to_bits(), Relaxed);
+        let shared_mix = mix.clone();
         let handle=thread::Builder::new().name("audio-control".into()).spawn(move || {
             let mut streams:Option<ActiveStreams>=None;
             let mut last_counts=(0,0);
@@ -143,7 +162,7 @@ impl Engine {
             let (devices,note)=enumerate_devices();
             let _=tx.send(Event::Devices(devices,note));
             let (ports,note)=midi::enumerate();let _=tx.send(Event::MidiDevices(ports,note));
-            let mut context=PlaybackContext {resources:media::Resources {font:media::default_font().ok(),..Default::default()},shared:shared_media};
+            let mut context=PlaybackContext {resources:media::Resources {font:media::default_font().ok(),..Default::default()},shared:shared_media, mix: shared_mix, plugin: None};
             loop {
                 match rx.recv_timeout(Duration::from_millis(25)) {
                     Ok(Command::InstallAudio(role,clip))=>{
@@ -154,6 +173,28 @@ impl Engine {
                                 context.shared.stop();context.shared.length.store(clip.frames.len() as u64,Relaxed);context.resources.backing=Some(clip);
                             }}
                         }else{let _=tx.send(Event::Notice("Audio update queue is busy. Load the file again.".into()));}
+                    }
+                    Ok(Command::ScanPlugin(path)) => {
+                        let event = plugin::scan(&path).map(Event::Plugins)
+                            .unwrap_or_else(|error| Event::Notice(format!("{error:#}")));
+                        let _ = tx.send(event);
+                    }
+                    Ok(Command::SelectPlugin(selection)) => {
+                        if streams.is_none() {
+                            context.plugin = selection.clone();
+                            let _ = tx.send(Event::PluginSelected(selection));
+                        } else {
+                            let _ = tx.send(Event::Notice("Stop audio before changing the CLAP insert".into()));
+                        }
+                    }
+                    Ok(Command::PlayMix(clip)) => {
+                        if let Some(active) = &mut streams {
+                            if active.mix_ports.updates.try_push(media::Update::Play(clip)).is_err() {
+                                let _ = tx.send(Event::Notice("Mix playback queue is busy".into()));
+                            }
+                        } else {
+                            let _ = tx.send(Event::Notice("Start an output before playing the mix".into()));
+                        }
                     }
                     Ok(Command::InstallFont(font))=>{
                         let prepared=if let Some(s)=streams.as_ref() {media::FontPlayer::new(&font,s.rate).map(|f|Some(media::Update::Font(Some(f))))}else{Ok(None)};
@@ -172,9 +213,18 @@ impl Engine {
                             let (ports,note)=midi::enumerate();let _=tx.send(Event::MidiDevices(ports,note));
                         }
                     }
-                    Ok(Command::Stop)=>{streams=None;m.clear_activity();context.shared.playing.store(false,Relaxed);let _=tx.send(Event::Stopped);}
+                    Ok(Command::Record) => {
+                        let accepted = streams.as_mut().is_some_and(|active| {
+                            active.source != InstrumentSource::Playback
+                                && active.recorder.start(active.rate, active.source, parameters.read(), SynthSound::from_index(m.sound.load(Relaxed)))
+                        });
+                        let _ = tx.send(if accepted { Event::Recording } else { Event::Notice("Start an input or instrument before recording".into()) });
+                    }
+                    Ok(Command::FinishTake) => { finish_take(&mut streams, &tx); }
+                    Ok(Command::Stop)=>{finish_take(&mut streams, &tx);streams=None;m.clear_activity();context.shared.playing.store(false,Relaxed);context.mix.stop();let _=tx.send(Event::Stopped);}
                     Ok(Command::Start(config))=>{
-                        streams=None; d.reset();m.clear_activity();m.messages.store(0,Relaxed);m.dropped.store(0,Relaxed);m.set_sound(config.synth_sound);
+                        finish_take(&mut streams, &tx);
+                        streams=None; context.mix.stop(); d.reset();m.clear_activity();m.messages.store(0,Relaxed);m.dropped.store(0,Relaxed);m.set_sound(config.synth_sound);
                         match open_streams(&config,parameters.clone(),d.clone(),m.clone(),&context) {
                             Ok((active,info))=>{
                                 streams=Some(active); last_counts=(0,0);last_activity=Instant::now();last_midi_check=Instant::now();
@@ -186,6 +236,13 @@ impl Engine {
                     Err(mpsc::RecvTimeoutError::Timeout)=>{}
                 }
                 if let Some(active)=streams.as_mut() {
+                    if let Some(control) = &mut active.plugin && let Some(notice) = control.poll() {
+                        let _ = tx.send(Event::Notice(notice.into()));
+                    }
+                    if active.recorder.drain() && let Some(take) = active.recorder.finish() {
+                        let _ = tx.send(Event::Take(take));
+                    }
+                    while let Some(retired)=active.mix_ports.retired.try_pop(){drop(retired);}
                     while let Some(retired)=active.ports.retired.try_pop(){drop(retired);}
                     let counts=(d.input_frames.load(Relaxed),d.output_frames.load(Relaxed));
                     if (active.input.is_none() || counts.0!=last_counts.0) && counts.1!=last_counts.1 {
@@ -197,7 +254,7 @@ impl Engine {
                             if !ports.iter().any(|p|p.id==*id) {d.fatal.store(true,Relaxed);}
                     }
                     if d.fatal.load(Relaxed) || last_activity.elapsed()>Duration::from_secs(3) {
-                        d.fatal.store(true,Relaxed); streams=None;m.clear_activity();context.shared.playing.store(false,Relaxed);
+                        d.fatal.store(true,Relaxed); finish_take(&mut streams, &tx); streams=None;m.clear_activity();context.shared.playing.store(false,Relaxed);context.mix.stop();
                         let _=tx.send(Event::Failed("Audio or MIDI device stopped or changed. Check its connection and driver, then use Reconnect. The selected output has not been changed.".into()));
                     }
                 }
@@ -210,6 +267,7 @@ impl Engine {
             diagnostics,
             midi,
             media,
+            mix,
             thread: Some(handle),
         }
     }
@@ -218,18 +276,30 @@ impl Engine {
     }
 }
 
+fn finish_take(streams: &mut Option<ActiveStreams>, tx: &mpsc::Sender<Event>) {
+    if let Some(take) = streams.as_mut().and_then(|active| active.recorder.finish()) {
+        let _ = tx.send(Event::Take(take));
+    }
+}
+
 struct ActiveStreams {
+    recorder: recording::Recorder,
+    source: InstrumentSource,
     ports: media::ControlPorts,
+    mix_ports: media::ControlPorts,
     rate: u32,
     input: Option<Stream>,
     _output: Stream,
     _midi: Option<midir::MidiInputConnection<()>>,
     midi_port: Option<String>,
+    plugin: Option<plugin::Control>,
 }
 #[derive(Clone)]
 struct PlaybackContext {
     resources: media::Resources,
     shared: Arc<media::State>,
+    mix: Arc<media::State>,
+    plugin: Option<EffectPlugin>,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -470,6 +540,9 @@ fn open_streams(
                 resampling,
                 connection,
                 ports,
+                mix_ports,
+                recorder,
+                plugin,
             }) => {
                 let info = RunningInfo {
                     source: config.source,
@@ -484,16 +557,22 @@ fn open_streams(
                     output_format: format!("{:?}", oc.sample_format()),
                 };
                 // Both ASIO streams must be built before either is started.
-                i.play().context("Start guitar capture")?;
-                o.play().context("Start playback")?;
+                if let Err(error) = i.play().and_then(|_| o.play()) {
+                    drop(o);
+                    return Err(error).context("Start input and output");
+                }
                 return Ok((
                     ActiveStreams {
+                        recorder,
+                        source: config.source,
                         ports,
+                        mix_ports,
                         rate: os.sample_rate,
                         input: Some(i),
                         _output: o,
                         _midi: connection,
                         midi_port: config.source.has_midi().then(|| config.midi_port.clone()),
+                        plugin,
                     },
                     info,
                 ));
@@ -542,12 +621,18 @@ fn prepare_pair(
         parameters,
         d.clone(),
     )?;
+    if config.source != InstrumentSource::Guitar && config.source != InstrumentSource::GuitarAndMidi
+    {
+        monitor.processor.use_full_instrument_range(oc.sample_rate);
+    }
     let connection = if config.source.has_midi() {
         Some(attach_keyboard(&mut monitor, config, midi_state)?)
     } else {
         None
     };
-    let ports = monitor.prepare_assets(context)?;
+    let (tap, recorder) = recording::pair();
+    monitor.tap = Some(tap);
+    let (ports, mix_ports) = monitor.prepare_assets(context)?;
     macro_rules! capture {
         ($t:ty) => {
             build_capture::<$t>(input, ic.clone(), config.input_channel, producer, d.clone())?
@@ -567,6 +652,7 @@ fn prepare_pair(
         SampleFormat::U64 => capture!(u64),
         _ => bail!("Unsupported capture sample format"),
     };
+    let plugin = monitor.prepare_plugin(context)?;
     let o = open_playback(output, oc, ofmt, monitor, d)?;
     Ok(PreparedPair {
         input: i,
@@ -574,14 +660,20 @@ fn prepare_pair(
         resampling,
         connection,
         ports,
+        mix_ports,
+        recorder,
+        plugin,
     })
 }
 struct PreparedPair {
+    recorder: recording::Recorder,
     input: Stream,
     output: Stream,
     resampling: bool,
     connection: Option<midir::MidiInputConnection<()>>,
     ports: media::ControlPorts,
+    mix_ports: media::ControlPorts,
+    plugin: Option<plugin::Control>,
 }
 
 fn open_playback(
@@ -674,7 +766,14 @@ fn open_keyboard(
         } else {
             None
         };
-        let ports = monitor.prepare_assets(context)?;
+        let (tap, recorder) = recording::pair();
+        monitor.tap = Some(tap);
+        let (ports, mix_ports) = monitor.prepare_assets(context)?;
+        let plugin = if config.source.has_midi() {
+            monitor.prepare_plugin(context)?
+        } else {
+            None
+        };
         match open_playback(
             &output,
             &stream_config,
@@ -695,16 +794,23 @@ fn open_keyboard(
                     input_format: "MIDI notes".into(),
                     output_format: format!("{:?}", supported.sample_format()),
                 };
-                output.play().context("Start keyboard audio")?;
+                if let Err(error) = output.play() {
+                    drop(output);
+                    return Err(error).context("Start playback");
+                }
                 return Ok((
                     ActiveStreams {
+                        recorder,
+                        source: config.source,
                         ports,
+                        mix_ports,
                         rate: stream_config.sample_rate,
                         input: None,
                         _output: output,
                         _midi: connection,
                         midi_port: (config.source.has_midi() && !config.midi_port.is_empty())
                             .then(|| config.midi_port.clone()),
+                        plugin,
                     },
                     info,
                 ));
@@ -816,7 +922,11 @@ impl DriftController {
 }
 
 pub struct Monitor {
+    tap: Option<recording::Tap>,
+    plugin: Option<plugin::Insert>,
+    plugin_master: f32,
     media: media::Runtime,
+    mix: Option<media::Runtime>,
     instrument: Option<midi::Instrument>,
     audio_enabled: bool,
     consumer: HeapCons<f32>,
@@ -865,6 +975,10 @@ impl Monitor {
         let filter_delay = resampler.as_ref().map_or(0, |r| r.output_delay());
         let p = parameters.read();
         Ok(Self {
+            tap: None,
+            plugin: None,
+            plugin_master: shredini_core::dsp::db_gain(p.output_db),
+            mix: None,
             media: media::Runtime::new(Arc::new(media::State::default()), None).0,
             instrument: None,
             audio_enabled: true,
@@ -889,7 +1003,10 @@ impl Monitor {
             last_overruns: 0,
         })
     }
-    fn prepare_assets(&mut self, context: &PlaybackContext) -> Result<media::ControlPorts> {
+    fn prepare_assets(
+        &mut self,
+        context: &PlaybackContext,
+    ) -> Result<(media::ControlPorts, media::ControlPorts)> {
         let (runtime, ports) =
             media::Runtime::new(context.shared.clone(), context.resources.backing.clone());
         self.media = runtime;
@@ -901,8 +1018,19 @@ impl Monitor {
                 instrument.refresh_font();
             }
         }
-        Ok(ports)
+        let (mix, mix_ports) = media::Runtime::new(context.mix.clone(), None);
+        self.mix = Some(mix);
+        Ok((ports, mix_ports))
     }
+    fn prepare_plugin(&mut self, context: &PlaybackContext) -> Result<Option<plugin::Control>> {
+        let Some(effect) = &context.plugin else {
+            return Ok(None);
+        };
+        let (control, processor) = plugin::Control::prepare(effect, self.output_rate)?;
+        self.plugin = Some(processor);
+        Ok(Some(control))
+    }
+
     fn refill(&mut self) -> bool {
         let mut need = self
             .resampler
@@ -980,14 +1108,33 @@ impl Monitor {
     }
     fn render<T: Sample + FromSample<f32>>(&mut self, output: &mut [T], channels: usize) {
         self.media.begin_block(&mut self.instrument);
+        if let Some(mix) = &mut self.mix {
+            mix.begin_block(&mut None);
+        }
         let p = self.parameters.read();
-        self.processor.set_parameters(p);
+        let target_master = shredini_core::dsp::db_gain(p.output_db);
+        let processor_settings = if self.plugin.is_some() {
+            shredini_core::model::ToneParameters {
+                output_db: 0.0,
+                ..p
+            }
+        } else {
+            p
+        };
+        self.processor.set_parameters(processor_settings);
         self.bypass_target = if p.bypass { 1.0 } else { 0.0 };
         let mut maximum = 0.0_f32;
         let mut clips = 0;
         let frames = output.len() / channels;
+        if let Some(tap) = &mut self.tap {
+            tap.begin();
+        }
         if let Some(instrument) = &mut self.instrument {
-            instrument.begin_block();
+            instrument.begin_block_with(|message| {
+                if let Some(tap) = &mut self.tap {
+                    tap.event(message);
+                }
+            });
         }
         let mut capture_available = self.audio_enabled;
         let mut source_peak = 0.0_f32;
@@ -1005,24 +1152,40 @@ impl Monitor {
                 mono = self.converted[self.position];
                 self.position += 1;
             }
-            if let Some(instrument) = &mut self.instrument {
-                mono += instrument.tick();
+            let instrument = self.instrument.as_mut().map_or(0.0, midi::Instrument::tick);
+            if let Some(tap) = &mut self.tap {
+                tap.push([mono, instrument]);
             }
+            mono += instrument;
             source_peak = source_peak.max(mono.abs());
             self.bypass +=
                 (self.bypass_target - self.bypass) * (1.0 / (0.020 * self.output_rate as f32));
-            let stereo = self.processor.tick(mono, self.bypass);
-            let backing = self.media.tick(self.output_rate, p.output_db);
+            let mut stereo = self.processor.tick(mono, self.bypass);
+            if let Some(plugin) = &mut self.plugin {
+                self.plugin_master +=
+                    (target_master - self.plugin_master) / (0.020 * self.output_rate as f32);
+                stereo = plugin
+                    .tick(stereo, self.bypass)
+                    .map(|sample| sample * self.plugin_master);
+            }
+            let mix = self.mix.as_mut().map_or([0.0; 2], |mix| {
+                mix.tick_gain(self.output_rate, target_master)
+            });
+            let backing = self.media.tick_gain(self.output_rate, target_master);
             self.fade = (self.fade + 1.0 / (0.005 * self.output_rate as f32)).min(1.0);
             frame.fill(T::EQUILIBRIUM);
             for i in 0..2 {
-                let x = crate::dsp::peak_protect(stereo[i] * self.fade + backing[i]);
+                let x =
+                    shredini_core::dsp::peak_protect(stereo[i] * self.fade + backing[i] + mix[i]);
                 maximum = maximum.max(x.abs());
                 if x.abs() > 0.98 {
                     clips += 1;
                 }
                 frame[i] = T::from_sample(x);
             }
+        }
+        if let Some(tap) = &mut self.tap {
+            tap.end();
         }
         peak(&self.d.output_peak, maximum);
         self.d.output_clips.fetch_add(clips, Relaxed);
@@ -1034,13 +1197,16 @@ impl Monitor {
             peak(&self.d.input_peak, source_peak);
         }
         self.media.publish();
+        if let Some(mix) = &self.mix {
+            mix.publish();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ToneParameters;
+    use shredini_core::model::ToneParameters;
     #[test]
     fn variable_callbacks_and_underrun_recovery() {
         let (mut producer, consumer) = HeapRb::<f32>::new(RING_CAPACITY).split();

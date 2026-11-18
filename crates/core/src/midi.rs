@@ -263,6 +263,10 @@ impl Instrument {
         self.state.clear_activity();
     }
     pub fn begin_block(&mut self) {
+        self.begin_block_with(|_| {});
+    }
+
+    pub fn begin_block_with(&mut self, mut received: impl FnMut(Message)) {
         let panic = self.state.panic.load(Relaxed);
         if panic != self.last_panic {
             self.last_panic = panic;
@@ -291,9 +295,28 @@ impl Instrument {
             let Some(message) = self.queue.try_pop() else {
                 break;
             };
+            received(message);
             self.handle(message);
         }
     }
+    /// Apply a timestamped sequencer event before rendering its sample.
+    pub fn dispatch(&mut self, message: Message) {
+        let message = match message {
+            Message::On(channel, key, velocity) if key < 128 && velocity > 0 => {
+                Message::On(channel.min(15), key, velocity.min(127))
+            }
+            Message::On(channel, key, 0) | Message::Off(channel, key) if key < 128 => {
+                Message::Off(channel.min(15), key)
+            }
+            Message::Control(channel, control, value) => {
+                Message::Control(channel.min(15), control.min(127), value.min(127))
+            }
+            Message::Bend(channel, value) => Message::Bend(channel.min(15), value.min(16383)),
+            _ => return,
+        };
+        self.handle(message);
+    }
+
     fn handle(&mut self, message: Message) {
         if self.sound.program().is_some()
             && let Some(font) = &mut self.font
